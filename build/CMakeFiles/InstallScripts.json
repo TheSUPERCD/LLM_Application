@@ -1,0 +1,14 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/thesupercd/Documents/LLM_Application/build/cmake_install.cmake",
+		"/home/thesupercd/Documents/LLM_Application/build/externals/llama.cpp/cmake_install.cmake",
+		"/home/thesupercd/Documents/LLM_Application/build/externals/llama.cpp/ggml/cmake_install.cmake",
+		"/home/thesupercd/Documents/LLM_Application/build/externals/llama.cpp/ggml/src/cmake_install.cmake",
+		"/home/thesupercd/Documents/LLM_Application/build/externals/llama.cpp/ggml/src/ggml-cpu/cmake_install.cmake",
+		"/home/thesupercd/Documents/LLM_Application/build/externals/llama.cpp/src/cmake_install.cmake",
+		"/home/thesupercd/Documents/LLM_Application/build/externals/llama.cpp/common/cmake_install.cmake",
+		"/home/thesupercd/Documents/LLM_Application/build/externals/llama.cpp/vendor/cpp-httplib/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
