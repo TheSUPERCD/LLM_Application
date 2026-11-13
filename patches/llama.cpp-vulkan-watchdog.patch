@@ -1,0 +1,159 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 870fa1155..fab76e0be 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -889,6 +889,9 @@ struct vk_device_struct {
+     bool add_rms_fusion;
+     uint32_t partials_binding_alignment;
+     uint32_t max_nodes_per_submit;
++    bool user_set_max_nodes = false;
++    double watchdog_budget_ms = 2000.0;
++    uint32_t flops_submit_divisor = 25;
+ 
+     bool shader_64b_indexing;
+ 
+@@ -6781,12 +6784,35 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         device->subgroup_vote = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
+                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
+ 
+-        // Submit at least every 100 nodes, in case there are workloads without as much matmul.
++        // Watchdog budget initialization:
++        device->watchdog_budget_ms = 2000.0;
++        const char* budget_ms_env = getenv("GGML_VK_WATCHDOG_BUDGET_MS");
++        if (budget_ms_env != nullptr) {
++            try {
++                device->watchdog_budget_ms = std::clamp(std::stod(budget_ms_env), 1000.0, 9500.0);
++            } catch (...) {}
++        }
++        const char* budget_sec_env = getenv("GGML_VK_WATCHDOG_BUDGET_SEC");
++        if (budget_sec_env != nullptr) {
++            try {
++                device->watchdog_budget_ms = std::clamp(std::stod(budget_sec_env) * 1000.0, 1000.0, 9500.0);
++            } catch (...) {}
++        }
++
++        // Default to the upstream node threshold. The application can override it for safe mode.
+         device->max_nodes_per_submit = 100;
++        device->user_set_max_nodes = false;
+         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
+         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
+             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
+             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
++            device->user_set_max_nodes   = true;
++        }
++
++        device->flops_submit_divisor = 25;
++        const char* GGML_VK_FLOPS_SUBMIT_DIVISOR = getenv("GGML_VK_FLOPS_SUBMIT_DIVISOR");
++        if (GGML_VK_FLOPS_SUBMIT_DIVISOR != nullptr) {
++            device->flops_submit_divisor = std::clamp<uint32_t>(std::stoul(GGML_VK_FLOPS_SUBMIT_DIVISOR), 1u, 1000u);
+         }
+ 
+         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
+@@ -6807,7 +6833,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+ 
+         // Try to find a non-graphics compute queue and transfer-focused queues
+         // Allow overriding avoiding the graphics queue because it can increase performance on RADV
+-        const bool allow_graphics_queue = (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr);
++        const bool allow_graphics_queue = device->uma || (getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE") != nullptr);
+         const vk::QueueFlagBits graphics_flag = allow_graphics_queue ? (vk::QueueFlagBits)0 : vk::QueueFlagBits::eGraphics;
+         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
+         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
+@@ -11207,7 +11233,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+     uint32_t workgroups_y = (uint32_t)neq2;
+     uint32_t workgroups_z = (uint32_t)neq3;
+ 
+-    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
++    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16 ||
++                        (getenv("GGML_VK_FLASH_ATTN_F32ACC") != nullptr);
+ 
+     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
+     auto is_dense_kv_cache = [](const ggml_tensor * t) {
+@@ -16622,7 +16649,9 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
+     // discard any unsubmitted command buffers
+     ctx->compute_ctx.reset();
+     // wait for any pending command buffers to finish
+-    ggml_vk_synchronize(ctx);
++    try {
++        ggml_vk_synchronize(ctx);
++    } catch (...) {}
+ 
+     ggml_vk_graph_cleanup(ctx);
+ 
+@@ -18046,18 +18075,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     uint64_t total_flops = 0;
+     uint64_t flops_cap = 200'000'000'000ULL;
+ 
+-    // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
++    // Hardware-adaptive FLOPs sizing:
++    // Scale submission thresholds with the configured Vulkan submission budget.
++    double budget_ms = ctx->device->watchdog_budget_ms;
+     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->shader_core_count > 0) {
+         if (ctx->device->architecture == AMD_GCN && ctx->device->shader_core_count < 32) {
+-            flops_cap = 500'000'000ULL * ctx->device->shader_core_count;
++            flops_cap = (5'000'000'000ULL * ctx->device->shader_core_count * (uint64_t)budget_ms) / 5000ULL;
+         } else if (ctx->device->architecture != AMD_GCN && ctx->device->shader_core_count < 24) {
+-            flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
++            // ~20 GFLOPs per CU scaled by watchdog budget ratio
++            flops_cap = (20'000'000'000ULL * ctx->device->shader_core_count * (uint64_t)budget_ms) / 5000ULL;
+         }
+     }
+-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
++    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / ctx->device->flops_submit_divisor);
+ 
+     auto const submit_after = [&](int start, int end) {
+         if (ctx->device->serialize_submissions) {
++            auto t0 = std::chrono::steady_clock::now();
+             try {
+                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
+                 if (res != vk::Result::eSuccess) {
+@@ -18071,11 +18104,33 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ggml_vk_print_node_list(cgraph, start, end);
+                 throw;
+             }
++            auto t1 = std::chrono::steady_clock::now();
++            double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
++
+             ctx->device->device.resetFences({ ctx->fence });
+             ctx->submit_pending = false;
+             ctx->device->diag_cgraph = cgraph;
+             ctx->device->diag_prev_start = start;
+             ctx->device->diag_prev_end = end;
++
++            // Closed-loop dynamic latency controller:
++            // Upper bound = watchdog compute budget (e.g. 9000ms for 9s run / 1s headroom, 7000ms for 7s run / 3s headroom).
++            // Lower bound = 25% of watchdog budget (capped at 1200ms) to ensure continuous GPU saturation.
++            // If the dispatch was fast (< lower_bound), increase batch size to reduce fence waits and CPU overhead.
++            // If the dispatch exceeded watchdog budget, immediately scale down to guarantee safety against kernel watchdog.
++            double lower_bound_ms = std::min(1200.0, budget_ms * 0.25);
++            uint32_t node_cap = ctx->device->uma ? (uint32_t)(budget_ms >= 8000.0 ? 96u : (budget_ms >= 6000.0 ? 64u : 48u)) : 128u;
++            if (elapsed_ms < lower_bound_ms) {
++                if (!ctx->device->user_set_max_nodes && ctx->device->max_nodes_per_submit < node_cap) {
++                    ctx->device->max_nodes_per_submit = std::min(node_cap, ctx->device->max_nodes_per_submit + 4u);
++                }
++                flops_per_submit = (flops_per_submit * 5u) / 4u;
++            } else if (elapsed_ms > budget_ms) {
++                if (!ctx->device->user_set_max_nodes) {
++                    ctx->device->max_nodes_per_submit = std::max(8u, (ctx->device->max_nodes_per_submit * 3u) / 4u);
++                }
++                flops_per_submit = std::max<uint64_t>(10'000'000'000ULL, (flops_per_submit * 3u) / 4u);
++            }
+         }
+         first_node_in_batch = true;
+         submitted_nodes = 0;
+@@ -18952,7 +19007,15 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
+             *total += heap.size;
+ 
+             if (membudget_supported && i < budgetprops.heapUsage.size()) {
+-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
++                if (is_integrated_gpu) {
++                    if (heap.size > budgetprops.heapUsage[i]) {
++                        *free += heap.size - budgetprops.heapUsage[i];
++                    }
++                } else if (budgetprops.heapBudget[i] > budgetprops.heapUsage[i]) {
++                    *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
++                } else if (heap.size > budgetprops.heapUsage[i]) {
++                    *free += heap.size - budgetprops.heapUsage[i];
++                }
+             } else {
+                 *free += heap.size;
+             }

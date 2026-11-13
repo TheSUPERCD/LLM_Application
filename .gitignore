@@ -1,15 +1,33 @@
-models/*
-build/*
-llm_engine.log
-CMakeLists.txt.user
+# Model files are runtime assets, not source.
+models/
+*.gguf
+
+# Generated build trees and tooling metadata.
+build/
+_deps/
 CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
+CMakeFiles/
+CMakeScripts/
+CTestTestfile.cmake
+Testing/
 cmake_install.cmake
 install_manifest.txt
+Makefile
 compile_commands.json
-CTestTestfile.cmake
-_deps
 CMakeUserPresets.json
+CMakeLists.txt.user
+.cache/
+
+# Runtime state and logs.
+llm_engine.log
+*.log
+.llm_engine_history
+
+# Crash dumps.
+core
+core.*
+vgcore.*
+*.core
+
+# AI-agent working notes and analysis. These are intentionally local-only.
+/AI-AGENT/
