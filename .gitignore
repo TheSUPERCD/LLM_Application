@@ -1,5 +1,5 @@
 # Model files are runtime assets, not source.
-models/
+models/*
 *.gguf
 
 # Generated build trees and tooling metadata.
