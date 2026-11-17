@@ -56,7 +56,7 @@ endif()
 # files are committed to this repository, the modifications survive a fresh
 # clone on any machine.
 #
-# Workflow when changing llama.cpp:
+# When changing llama.cpp:
 #   1. edit files under externals/llama.cpp
 #   2. run ./scripts/update-llama-patch.sh   (regenerates the patch)
 #   3. commit the updated patch file
